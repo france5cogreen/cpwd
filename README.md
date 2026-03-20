@@ -86,3 +86,4 @@ This script handles sensitive data, use it only after accurate tests on your env
 - [ ] Regex-based output parsing to detect vendor error messages post-command
 - [ ] `--verify-only` mode: test login without changing anything
 - [ ] Config backup before password change (e.g. `show running-config` → file)
+- [ ] Implementation of the -v option to show the actual script version
