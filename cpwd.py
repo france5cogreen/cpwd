@@ -1,18 +1,27 @@
 """
-change_pwd.py — Batch password changer for network devices (Cisco, Fortinet, Palo Alto, SonicWall, Alcatel, Tiesse)
+cpwd.py — Batch password changer for network devices
 
-USO:
-    python change_pwd.py ip_list.txt [--wet-run] [--workers N] [--log-file FILE] [--output FILE]
+USAGE:
+    python cpwd.py ip_list.txt [--wet-run] [--workers N] [--log-file FILE] [--output FILE]
 
-OPZIONI:
-    lista_ip.txt        File con un IP per riga (righe con # ignorate)
-    --wet-run           Esegue realmente sui dispositivi (default: dry-run)
-    --workers N         Thread paralleli (default: 4)
-    --device-type TYPE  sonicwall | alcatel | tiesse (se omesso: chiesto interattivamente)
-    --log-file FILE     Salva il log su file
-    --output FILE       File di output (default: output_passwords.txt)
-    --shared-password   Genera una sola password per tutti gli IP (default: una per IP)
-    -h / --help         Mostra questo aiuto
+OPTIONS:
+    ip_list.txt         File with one IP per line (lines starting with # are ignored)
+    --wet-run           Actually apply changes (default: dry-run / simulation only)
+    --workers N         Parallel threads (default: 4)
+    --device-type TYPE  Device type; see supported list below. If omitted: prompted interactively.
+    --log-file FILE     Save log to file
+    --output FILE       Output report file (default: output_passwords.txt)
+    --shared-password   Use a single generated password for all IPs (default: one per IP)
+    -h / --help         Show this help
+
+SUPPORTED DEVICE TYPES:
+    sonicwall | alcatel | tiesse | cisco | fortios | paloalto | checkpoint | juniper | huawei
+
+NOTES:
+    - Default mode is dry-run: no device is touched. Pass --wet-run to make real changes.
+    - Verify command syntax for your firmware version before production use.
+    - On critical failure (neither old nor new password works), the script attempts rollback
+      and opens an interactive SSH shell for manual recovery (Linux only).
 """
 
 import sys
@@ -32,11 +41,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import paramiko
 
 
+SUPPORTED_DEVICE_TYPES = [
+    "sonicwall", "alcatel", "tiesse",
+    "cisco", "fortios", "paloalto", "checkpoint", "juniper", "huawei",
+]
+
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
+
 def setup_logging(log_file=None):
-    logger = logging.getLogger("change_pwd")
+    logger = logging.getLogger("cpwd")
     logger.setLevel(logging.DEBUG)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     ch = logging.StreamHandler(sys.stdout)
@@ -54,46 +70,142 @@ log = setup_logging()
 
 
 # ---------------------------------------------------------------------------
-# Generazione password
+# Password generation
 # ---------------------------------------------------------------------------
+
 _CHARS = string.ascii_letters + string.digits + "!@#%^&*()-_=+{}:,.<>?"
 
-def genera_password(lunghezza=20):
+def generate_password(length=20):
+    """Generate a random password satisfying complexity requirements."""
     while True:
-        pwd = "".join(secrets.choice(_CHARS) for _ in range(lunghezza))
+        pwd = "".join(secrets.choice(_CHARS) for _ in range(length))
         if (any(c.isupper() for c in pwd) and any(c.islower() for c in pwd)
                 and any(c.isdigit() for c in pwd) and any(c in string.punctuation for c in pwd)):
             return pwd
 
 
 # ---------------------------------------------------------------------------
-# Comandi vendor  #tmp — verificare sintassi esatta per firmware in uso
+# Vendor command sets
+# NOTE: verify exact syntax against your firmware version before production use.
 # ---------------------------------------------------------------------------
-# #tmp — verificare sintassi esatta per firmware in uso
-def _comandi(device_type, utente, da_pwd, a_pwd):
-    """Unica funzione comandi: da_pwd → a_pwd. Usata sia per cambio che per rollback."""
+
+def _commands(device_type, username, old_pwd, new_pwd):
+    """Return the CLI command sequence to change password from old_pwd to new_pwd.
+    Used for both the change and rollback operations."""
+
     if device_type == "sonicwall":
-        return ["configure", "administration", f"admin password old-password {da_pwd} new-password {a_pwd} confirm-password {a_pwd}", "exit", "commit", "exit"]
+        return [
+            "configure",
+            "administration",
+            f"admin password old-password {old_pwd} new-password {new_pwd} confirm-password {new_pwd}",
+            "exit", "commit", "exit",
+        ]
+
     elif device_type == "alcatel":
-        return ["enable", "configure terminal", f"user password {utente} {a_pwd}", "write memory", "exit"]
+        return [
+            "enable",
+            "configure terminal",
+            f"user password {username} {new_pwd}",
+            "write memory", "exit",
+        ]
+
     elif device_type == "tiesse":
-        return ["enable", "configure terminal", f"username {utente} password {a_pwd}", "commit", "write", "exit"]
+        return [
+            "enable",
+            "configure terminal",
+            f"username {username} password {new_pwd}",
+            "commit", "write", "exit",
+        ]
+
+    elif device_type == "cisco":
+        # IOS / IOS-XE: privilege-exec then update username secret
+        return [
+            "enable",
+            "configure terminal",
+            f"username {username} privilege 15 secret {new_pwd}",
+            "end",
+            "write memory",
+        ]
+
+    elif device_type == "fortios":
+        # FortiOS: config system admin
+        return [
+            "config system admin",
+            f"edit {username}",
+            f"set password {new_pwd}",
+            "end",
+        ]
+
+    elif device_type == "paloalto":
+        # PAN-OS: set admin password via CLI (> set password works in operational mode)
+        return [
+            f"set cli pager off",
+            f"set password",          # triggers interactive prompt on real devices;
+            new_pwd,                  # new password
+            new_pwd,                  # confirm
+        ]
+
+    elif device_type == "checkpoint":
+        # Gaia OS: clish
+        return [
+            "clish",
+            f"set user {username} password-hash",  # Gaia accepts plain via set user <u> password
+            # Using the plain-password variant for scripting compatibility:
+            f"set user {username} password",
+            new_pwd,
+            new_pwd,
+            "save config",
+        ]
+
+    elif device_type == "juniper":
+        # Junos: set system login user password
+        return [
+            "configure",
+            f"set system login user {username} authentication plain-text-password",
+            new_pwd,   # password prompt
+            new_pwd,   # confirmation prompt
+            "commit",
+            "exit",
+        ]
+
+    elif device_type == "huawei":
+        # VRP (VRP5 / VRP8): aaa + local-user
+        return [
+            "system-view",
+            "aaa",
+            f"local-user {username} password irreversible-cipher {new_pwd}",
+            "quit", "quit",
+            "save",
+            "y",
+        ]
+
     else:
-        raise ValueError(f"Tipo dispositivo '{device_type}' non supportato.")
+        raise ValueError(f"Unsupported device type: '{device_type}'")
 
 
 # ---------------------------------------------------------------------------
 # SSH helpers
 # ---------------------------------------------------------------------------
+
 _SSH_TIMEOUT = 10
 _TCP_TIMEOUT = 5
 
-def host_raggiungibile(ip, porta=22):
+# Known interactive prompts that require a reply before continuing
+_INTERACTIVE_PROMPTS = [
+    (b"(yes/no)?", b"yes\n"),
+    (b"(yes/no):",  b"yes\n"),
+    (b"[yes/no]",   b"yes\n"),
+    (b"Password:",  None),   # handled separately in Junos/Checkpoint password flows
+]
+
+
+def host_reachable(ip, port=22):
     try:
-        with socket.create_connection((ip, porta), timeout=_TCP_TIMEOUT):
+        with socket.create_connection((ip, port), timeout=_TCP_TIMEOUT):
             return True
     except OSError:
         return False
+
 
 def ssh_connect(ip, username, password):
     client = paramiko.SSHClient()
@@ -105,8 +217,9 @@ def ssh_connect(ip, username, password):
     )
     return client
 
+
 def _shell_read(shell, timeout=3.0):
-    """Legge l'output disponibile entro timeout secondi."""
+    """Read available shell output within timeout seconds."""
     buf = b""
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -116,30 +229,26 @@ def _shell_read(shell, timeout=3.0):
             time.sleep(0.1)
     return buf
 
-# Prompt interattivi noti che richiedono risposta prima di procedere
-_INTERACTIVE_PROMPTS = [
-    (b"(yes/no)?", b"yes\n"),
-    (b"(yes/no):", b"yes\n"),
-    (b"[yes/no]",  b"yes\n"),
-]
 
-def ssh_run_commands(client, comandi):
+def ssh_run_commands(client, commands):
+    """Send commands over an interactive shell, handling known prompts."""
     shell = client.invoke_shell()
     time.sleep(0.8)
-    for cmd in comandi:
+    for cmd in commands:
         shell.send(cmd + "\n")
         buf = _shell_read(shell, timeout=2.0)
         if buf:
-            log.debug("Output shell: %s", buf.decode(errors="replace"))
+            log.debug("Shell output: %s", buf.decode(errors="replace"))
         for pattern, reply in _INTERACTIVE_PROMPTS:
-            if pattern in buf:
-                log.debug("Prompt rilevato '%s' — rispondo yes.", pattern.decode())
+            if reply and pattern in buf:
+                log.debug("Prompt detected '%s' — replying.", pattern.decode())
                 shell.send(reply)
                 buf2 = _shell_read(shell, timeout=2.0)
                 if buf2:
-                    log.debug("Output post-reply: %s", buf2.decode(errors="replace"))
+                    log.debug("Post-reply output: %s", buf2.decode(errors="replace"))
                 break
-    _shell_read(shell, timeout=1.0)  # flush finale
+    _shell_read(shell, timeout=1.0)  # final flush
+
 
 def test_login(ip, username, password):
     try:
@@ -147,26 +256,29 @@ def test_login(ip, username, password):
         c.close()
         return True
     except Exception as exc:
-        log.debug("test_login(%s) fallito: %s", ip, exc)
+        log.debug("test_login(%s) failed: %s", ip, exc)
         return False
 
+
 def _test_login_thread(ip, username, password, timeout=20.0):
-    """Lancia test_login in un thread separato; il thread è completato prima del ritorno."""
+    """Run test_login in a dedicated thread; joins before returning."""
     result = [None]
     def _run():
         result[0] = test_login(ip, username, password)
     t = threading.Thread(target=_run, daemon=True)
     t.start()
-    t.join(timeout=timeout)  # thread 2 si chiude qui prima di procedere
+    t.join(timeout=timeout)
     if t.is_alive():
-        log.warning("[%s] test_login timeout dopo %.0fs", ip, timeout)
+        log.warning("[%s] test_login timed out after %.0fs", ip, timeout)
         return None
     return result[0]
 
-def shell_interattiva(client):
-    """Cede la sessione SSH aperta all'operatore.  #tmp — verificare compatibilità su Windows (tty/termios non disponibili)"""
+
+def interactive_shell(client):
+    """Hand the open SSH session to the operator for manual intervention.
+    Linux only (requires tty/termios)."""
     import tty, termios, select
-    log.info("Shell interattiva aperta. Ctrl+C per uscire.")
+    log.info("Interactive shell opened. Press Ctrl+C to exit.")
     channel = client.invoke_shell()
     old_tty = termios.tcgetattr(sys.stdin)
     try:
@@ -188,26 +300,29 @@ def shell_interattiva(client):
         pass
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
-    log.info("Shell interattiva chiusa.")
+    log.info("Interactive shell closed.")
 
 
 # ---------------------------------------------------------------------------
 # Dry-run wrappers
 # ---------------------------------------------------------------------------
+
 def _ssh_connect(ip, username, password, dry_run):
     if dry_run:
         log.debug("[DRY-RUN] ssh_connect(%s)", ip)
-        class _D:
+        class _Dummy:
             def close(self): pass
-        return _D()
+        return _Dummy()
     return ssh_connect(ip, username, password)
 
-def _ssh_run_commands(client, comandi, dry_run):
+
+def _ssh_run_commands(client, commands, dry_run):
     if dry_run:
-        for cmd in comandi:
-            log.debug("[DRY-RUN] Eseguirei: %s", cmd)
+        for cmd in commands:
+            log.debug("[DRY-RUN] Would run: %s", cmd)
         return
-    ssh_run_commands(client, comandi)
+    ssh_run_commands(client, commands)
+
 
 def _test_login_wrap(ip, username, password, dry_run):
     if dry_run:
@@ -215,187 +330,187 @@ def _test_login_wrap(ip, username, password, dry_run):
         return False
     return _test_login_thread(ip, username, password)
 
-def _shell_interattiva(client, dry_run):
+
+def _interactive_shell(client, dry_run):
     if dry_run:
-        log.info("[DRY-RUN] Shell interattiva non disponibile.")
+        log.info("[DRY-RUN] Interactive shell not available.")
         return
-    shell_interattiva(client)
+    interactive_shell(client)
 
 
 # ---------------------------------------------------------------------------
-# Logica per singolo dispositivo
+# Per-device logic
 # ---------------------------------------------------------------------------
+
 def process_device(ip, device_type, username, old_password, dry_run, new_password=None):
     t_start = time.monotonic()
-    ris = {"ip": ip, "status": "", "password": "", "timestamp": datetime.now().isoformat(), "elapsed_s": 0}
+    result = {
+        "ip": ip,
+        "status": "",
+        "password": "",
+        "timestamp": datetime.now().isoformat(),
+        "elapsed_s": 0,
+    }
 
-    # Pre-check TCP: fail fast se l'IP è down
+    def _done(status, password=""):
+        result["status"] = status
+        result["password"] = password
+        result["elapsed_s"] = round(time.monotonic() - t_start, 1)
+        return result
+
+    # TCP pre-check: fail fast if host is unreachable
     if not dry_run:
-        log.info("[%s] Controllo raggiungibilità (TCP:22)...", ip)
-        if not host_raggiungibile(ip):
-            ris["status"] = "host_non_raggiungibile"
-            ris["elapsed_s"] = round(time.monotonic() - t_start, 1)
-            log.warning("[%s] ✗ %s", ip, ris["status"])
-            return ris
+        log.info("[%s] Checking reachability (TCP:22)...", ip)
+        if not host_reachable(ip):
+            log.warning("[%s] ✗ host_unreachable", ip)
+            return _done("host_unreachable")
 
-    log.info("[%s] Verifica login iniziale...", ip)
+    log.info("[%s] Verifying initial login...", ip)
     if not _test_login_wrap(ip, username, old_password, dry_run):
-        ris["status"] = "errore_login_iniziale"
-        ris["elapsed_s"] = round(time.monotonic() - t_start, 1)
-        log.warning("[%s] ✗ %s", ip, ris["status"])
-        return ris
+        log.warning("[%s] ✗ initial_login_failed", ip)
+        return _done("initial_login_failed")
 
     if new_password is None:
-        new_password = genera_password()
+        new_password = generate_password()
 
     try:
-        client1 = _ssh_connect(ip, username, old_password, dry_run)
+        client = _ssh_connect(ip, username, old_password, dry_run)
     except Exception as exc:
-        ris["status"] = f"errore_connessione: {exc}"
-        ris["elapsed_s"] = round(time.monotonic() - t_start, 1)
-        log.error("[%s] ✗ %s", ip, ris["status"])
-        return ris
+        log.error("[%s] ✗ connection_error: %s", ip, exc)
+        return _done(f"connection_error: {exc}")
 
-    log.info("[%s] Invio comandi cambio password...", ip)
+    log.info("[%s] Sending password-change commands...", ip)
     try:
-        _ssh_run_commands(client1, _comandi(device_type, username, old_password, new_password), dry_run)
+        _ssh_run_commands(client, _commands(device_type, username, old_password, new_password), dry_run)
     except Exception as exc:
-        client1.close()
-        ris["status"] = f"errore_cambio_password: {exc}"
-        ris["elapsed_s"] = round(time.monotonic() - t_start, 1)
-        log.error("[%s] ✗ %s", ip, ris["status"])
-        return ris
+        client.close()
+        log.error("[%s] ✗ change_error: %s", ip, exc)
+        return _done(f"change_error: {exc}")
 
-    # Thread 2: testa nuova password — si chiude prima di proseguire
-    log.info("[%s] Verifica nuova password (thread separato)...", ip)
+    # Verify new password in a separate thread
+    log.info("[%s] Verifying new password...", ip)
     ok_new = _test_login_wrap(ip, username, new_password, dry_run)
 
     if ok_new is True:
-        client1.close()
-        ris["status"] = "ok_password_cambiata"
-        ris["password"] = new_password
-        ris["elapsed_s"] = round(time.monotonic() - t_start, 1)
-        log.info("[%s] ✓ Password cambiata con successo (%.1fs)", ip, ris["elapsed_s"])
-        return ris
+        client.close()
+        log.info("[%s] ✓ password changed (%.1fs)", ip, round(time.monotonic() - t_start, 1))
+        return _done("ok_password_changed", new_password)
 
     if ok_new is False:
-        log.warning("[%s] Nuova password non accettata. Verifica vecchia password...", ip)
+        log.warning("[%s] New password rejected. Checking old password...", ip)
         ok_old = _test_login_wrap(ip, username, old_password, dry_run)
 
         if ok_old is True:
-            client1.close()
-            ris["status"] = "password_invariata_vecchia_attiva"
-            ris["password"] = old_password
-            ris["elapsed_s"] = round(time.monotonic() - t_start, 1)
-            log.warning("[%s] ⚠ Vecchia password ancora attiva — nessun cambio effettuato (%.1fs)", ip, ris["elapsed_s"])
-            return ris
+            client.close()
+            log.warning("[%s] ⚠ Old password still active — no change applied.", ip)
+            return _done("warning_password_unchanged", old_password)
 
         if ok_old is False:
-            log.error("[%s] ✗ CRITICO: nessuna password funziona. Tentativo rollback...", ip)
+            log.error("[%s] ✗ CRITICAL: neither password works. Attempting rollback...", ip)
             try:
-                _ssh_run_commands(client1, _comandi(device_type, username, new_password, old_password), dry_run)
-                log.info("[%s] Rollback inviato.", ip)
+                _ssh_run_commands(client, _commands(device_type, username, new_password, old_password), dry_run)
+                log.info("[%s] Rollback sent.", ip)
             except Exception as exc:
-                log.error("[%s] Rollback fallito: %s", ip, exc)
-            _shell_interattiva(client1, dry_run)
-            client1.close()
-            ris["status"] = "CRITICO_intervento_manuale_eseguito"
-            ris["elapsed_s"] = round(time.monotonic() - t_start, 1)
-            return ris
+                log.error("[%s] Rollback failed: %s", ip, exc)
+            _interactive_shell(client, dry_run)
+            client.close()
+            return _done("CRITICAL_manual_intervention_required")
 
-    # ok_new è None: timeout del thread di test
-    log.error("[%s] ✗ CRITICO: timeout verifica password — stato dispositivo incerto (%.1fs)", ip, round(time.monotonic() - t_start, 1))
-    client1.close()
-    ris["status"] = "CRITICO_timeout_stato_incerto"
-    ris["elapsed_s"] = round(time.monotonic() - t_start, 1)
-    return ris
+    # ok_new is None: login test thread timed out
+    log.error("[%s] ✗ CRITICAL: password verification timed out — device state unknown.", ip)
+    client.close()
+    return _done("CRITICAL_timeout_unknown_state")
 
 
 # ---------------------------------------------------------------------------
 # I/O
 # ---------------------------------------------------------------------------
+
 def load_ips(path):
     if not os.path.isfile(path):
-        raise FileNotFoundError(f"File IP non trovato: {path}")
+        raise FileNotFoundError(f"IP list file not found: {path}")
     ips = [l.strip() for l in open(path, encoding="utf-8") if l.strip() and not l.startswith("#")]
     if not ips:
-        raise ValueError(f"Nessun IP in {path}")
+        raise ValueError(f"No IPs found in {path}")
     return ips
+
 
 def save_output(results, path="output_passwords.txt"):
     if os.path.exists(path):
         bak = path + f".bak_{int(time.time())}"
         os.rename(path, bak)
-        log.info("Backup precedente: %s", bak)
+        log.info("Previous report backed up: %s", bak)
 
-    # Categorizzazione
-    ok      = [r for r in results if r["status"] == "ok_password_cambiata"]
-    warn    = [r for r in results if r["status"] in ("password_invariata_vecchia_attiva",)]
-    down    = [r for r in results if r["status"] == "host_non_raggiungibile"]
-    critici = [r for r in results if r["status"].startswith("CRITICO")]
-    errori  = [r for r in results if r not in ok and r not in warn and r not in down and r not in critici]
+    ok       = [r for r in results if r["status"] == "ok_password_changed"]
+    warn     = [r for r in results if r["status"] == "warning_password_unchanged"]
+    down     = [r for r in results if r["status"] == "host_unreachable"]
+    critical = [r for r in results if r["status"].startswith("CRITICAL")]
+    errors   = [r for r in results if r not in ok and r not in warn and r not in down and r not in critical]
 
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     with open(path, "w", encoding="utf-8") as f:
-        f.write(f"# Generato: {ts}\n")
-        f.write("# TRATTA COME SEGRETO\n")
+        f.write(f"# Generated: {ts}\n")
+        f.write("# TREAT AS SECRET\n")
         f.write("=" * 80 + "\n\n")
-
-        f.write(f"RIEPILOGO\n")
-        f.write(f"  Totale elaborati : {len(results)}\n")
-        f.write(f"  ✓ OK             : {len(ok)}\n")
-        f.write(f"  ⚠ Warning        : {len(warn)}\n")
-        f.write(f"  ✗ Non raggiung.  : {len(down)}\n")
-        f.write(f"  ✗ Errori         : {len(errori)}\n")
-        f.write(f"  ✗ CRITICI        : {len(critici)}\n")
+        f.write("SUMMARY\n")
+        f.write(f"  Total processed : {len(results)}\n")
+        f.write(f"  ✓ OK            : {len(ok)}\n")
+        f.write(f"  ⚠ Warnings      : {len(warn)}\n")
+        f.write(f"  ✗ Unreachable   : {len(down)}\n")
+        f.write(f"  ✗ Errors        : {len(errors)}\n")
+        f.write(f"  ✗ CRITICAL      : {len(critical)}\n")
         f.write("\n" + "=" * 80 + "\n\n")
 
-        def _sezione(titolo, lista, mostra_pwd=False):
-            if not lista:
+        def _section(title, lst, show_pwd=False):
+            if not lst:
                 return
-            f.write(f"--- {titolo} ({len(lista)}) ---\n")
-            for r in lista:
-                pwd_field = f"  pwd: {r.get('password','')}" if mostra_pwd and r.get("password") else ""
+            f.write(f"--- {title} ({len(lst)}) ---\n")
+            for r in lst:
+                pwd_field = f"  pwd: {r.get('password', '')}" if show_pwd and r.get("password") else ""
                 f.write(f"  {r['ip']:<18} {r['status']:<45} {r.get('elapsed_s', '')}s{pwd_field}\n")
             f.write("\n")
 
-        _sezione("OK — password cambiata", ok, mostra_pwd=True)
-        _sezione("WARNING — password invariata", warn, mostra_pwd=True)
-        _sezione("NON RAGGIUNGIBILI", down)
-        _sezione("ERRORI", errori)
-        _sezione("CRITICI — intervento manuale", critici)
+        _section("OK — password changed", ok, show_pwd=True)
+        _section("WARNING — password unchanged", warn, show_pwd=True)
+        _section("UNREACHABLE", down)
+        _section("ERRORS", errors)
+        _section("CRITICAL — manual intervention required", critical)
 
-    # JSON strutturato
     json_path = path.replace(".txt", ".json")
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump({"generato": ts, "totale": len(results), "risultati": results}, f, indent=2, ensure_ascii=False)
+        json.dump({"generated": ts, "total": len(results), "results": results},
+                  f, indent=2, ensure_ascii=False)
 
-    log.info("Report TXT : %s", path)
-    log.info("Report JSON: %s", json_path)
-    log.info("Riepilogo  : %d OK | %d warning | %d down | %d errori | %d CRITICI",
-             len(ok), len(warn), len(down), len(errori), len(critici))
+    log.info("TXT report : %s", path)
+    log.info("JSON report: %s", json_path)
+    log.info("Summary    : %d OK | %d warn | %d down | %d errors | %d CRITICAL",
+             len(ok), len(warn), len(down), len(errors), len(critical))
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Entry point
 # ---------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Cambio password batch su dispositivi di rete.",
+        description="Batch password changer for network devices.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("file_ip", help="File con un IP per riga")
+    parser.add_argument("ip_list", help="File with one IP per line")
     parser.add_argument("--wet-run", action="store_true", default=False,
-                        help="Esegue realmente sui dispositivi (default: dry-run)")
-    parser.add_argument("--workers", type=int, default=4, help="Thread paralleli (default: 4)")
-    parser.add_argument("--device-type", choices=["sonicwall", "alcatel", "tiesse"],
-                        help="Tipo dispositivo (se omesso: chiesto interattivamente)")
-    parser.add_argument("--log-file", default=None, help="Salva il log su file")
-    parser.add_argument("--output", default="output_passwords.txt", help="File di output")
+                        help="Apply changes for real (default: dry-run)")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Parallel threads (default: 4)")
+    parser.add_argument("--device-type", choices=SUPPORTED_DEVICE_TYPES,
+                        help="Device type (prompted interactively if omitted)")
+    parser.add_argument("--log-file", default=None,
+                        help="Save log to file")
+    parser.add_argument("--output", default="output_passwords.txt",
+                        help="Output report file (default: output_passwords.txt)")
     parser.add_argument("--shared-password", action="store_true", default=False,
-                        help="Genera una sola password per tutti gli IP (default: una per IP)")
+                        help="Use one shared password for all IPs (default: one per IP)")
     args = parser.parse_args()
 
     dry_run = not args.wet_run
@@ -405,43 +520,45 @@ def main():
 
     if dry_run:
         log.info("=" * 60)
-        log.info("DRY-RUN ATTIVO — nessun dispositivo verrà modificato")
-        log.info("Usa --wet-run per eseguire in produzione")
+        log.info("DRY-RUN MODE — no device will be modified")
+        log.info("Use --wet-run to apply changes in production")
         log.info("=" * 60)
     else:
-        log.warning("WET-RUN ATTIVO — i dispositivi verranno modificati realmente")
+        log.warning("WET-RUN MODE — changes will be applied to real devices")
 
     try:
-        lista_ip = load_ips(args.file_ip)
+        ip_list = load_ips(args.ip_list)
     except (FileNotFoundError, ValueError) as exc:
         log.error("%s", exc)
         sys.exit(1)
-    log.info("IP da elaborare: %d", len(lista_ip))
+    log.info("IPs to process: %d", len(ip_list))
 
-    device_type = args.device_type or input("Tipo dispositivo (sonicwall/alcatel/tiesse): ").lower().strip()
-    if device_type not in ("sonicwall", "alcatel", "tiesse"):
-        log.error("Tipo dispositivo '%s' non supportato.", device_type)
+    device_type = args.device_type or input(
+        f"Device type ({'/'.join(SUPPORTED_DEVICE_TYPES)}): "
+    ).lower().strip()
+    if device_type not in SUPPORTED_DEVICE_TYPES:
+        log.error("Unsupported device type: '%s'", device_type)
         sys.exit(1)
 
     username = input("Username: ").strip()
     if not username:
-        log.error("Username vuoto.")
+        log.error("Username cannot be empty.")
         sys.exit(1)
 
-    old_password = getpass.getpass("Password attuale: ")
+    old_password = getpass.getpass("Current password: ")
     if not old_password:
-        log.error("Password vuota.")
+        log.error("Password cannot be empty.")
         sys.exit(1)
 
-    shared_pwd = genera_password() if args.shared_password else None
+    shared_pwd = generate_password() if args.shared_password else None
     if shared_pwd:
-        log.info("Modalità password condivisa — stessa password per tutti gli IP.")
+        log.info("Shared-password mode — same password applied to all IPs.")
 
     results = []
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {
             executor.submit(process_device, ip, device_type, username, old_password, dry_run, shared_pwd): ip
-            for ip in lista_ip
+            for ip in ip_list
         }
         for future in as_completed(futures):
             ip = futures[future]
@@ -450,9 +567,11 @@ def main():
                 results.append(res)
                 log.info("[%s] %s", ip, res["status"])
             except Exception as exc:
-                log.error("[%s] Eccezione non gestita: %s", ip, exc)
-                results.append({"ip": ip, "status": f"eccezione: {exc}", "password": "",
-                                 "timestamp": datetime.now().isoformat()})
+                log.error("[%s] Unhandled exception: %s", ip, exc)
+                results.append({
+                    "ip": ip, "status": f"exception: {exc}", "password": "",
+                    "timestamp": datetime.now().isoformat(),
+                })
 
     results.sort(key=lambda r: r["ip"])
     save_output(results, args.output)
