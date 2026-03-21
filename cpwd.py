@@ -12,6 +12,7 @@ OPTIONS:
     --log-file FILE     Save log to file
     --output FILE       Output report file (default: output_passwords.txt)
     --shared-password   Use a single generated password for all IPs (default: one per IP)
+    -v / --version      Show version information
     -h / --help         Show this help
 
 SUPPORTED DEVICE TYPES:
@@ -23,6 +24,8 @@ NOTES:
     - On critical failure (neither old nor new password works), the script attempts rollback
       and opens an interactive SSH shell for manual recovery (Linux only).
 """
+
+__version__ = "1.0.0"
 
 import sys
 import time
@@ -511,6 +514,9 @@ def main():
                         help="Output report file (default: output_passwords.txt)")
     parser.add_argument("--shared-password", action="store_true", default=False,
                         help="Use one shared password for all IPs (default: one per IP)")
+    parser.add_argument("-v", "--version", action="version",
+                        version=f"cpwd {__version__}",
+                        help="Show version information")
     args = parser.parse_args()
 
     dry_run = not args.wet_run
